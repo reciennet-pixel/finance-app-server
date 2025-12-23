@@ -11,6 +11,7 @@ from .serializers import  ExpenseSerializer, InstallmentSerializer
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.db.models import Sum, Q
+from django.utils.timezone import now
 
 # Create your views here.
 class ExpenseViewSet(viewsets.ModelViewSet):
@@ -65,33 +66,114 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             )
             installments.append(inst)
         Installment.objects.bulk_create(installments)
+    
     def pay_month(self, request, card_id=None):
-        """
-        Acción a nivel tarjeta: marca las cuotas correspondientes al mes actual como pagadas.
-        Lógica: todas las installments cuyo due_date esté dentro del mes actual.
-        """
-        today = date.today()
-        first_day = today.replace(day=1)
-        last_day = (first_day.replace(month=first_day.month % 12 + 1, day=1) - timedelta(days=1))
-        installments = Installment.objects.filter(
-            expense__card_id=card_id,
-            is_paid=False,
-            due_date__gte=first_day,
-            due_date__lte=last_day
-        )
+        today = now().date()
+        expenses = Expense.objects.filter(card_id=card_id, is_paid=False)
+        
+        details = [] # Aquí guardaremos el desglose profesional
+        total_amount_processed = 0
+
         with transaction.atomic():
-            for inst in installments:
-                inst.is_paid = True
-                inst.save()
-                # each expense check
-                exp = inst.expense
-                paid_count = exp.installments.filter(is_paid=True).count()
-                if paid_count >= (exp.months or 0):
+            for exp in expenses:
+                if exp.installments.exists():
+                    next_installment = exp.installments.filter(is_paid=False).order_by('month_number').first()
+                    
+                    if next_installment:
+                        next_installment.is_paid = True
+                        next_installment.save()
+                        
+                        # Guardamos el detalle del MSI
+                        details.append({
+                            'title': exp.title,
+                            'type': 'MSI',
+                            'info': f"Cuota {next_installment.month_number} de {exp.months}",
+                            'amount': float(next_installment.amount)
+                        })
+                        total_amount_processed += float(next_installment.amount)
+                        
+                        # Actualización de estados
+                        paid_count = exp.installments.filter(is_paid=True).count()
+                        exp.remaining_months = max(0, (exp.months or 0) - paid_count)
+                        if exp.remaining_months == 0:
+                            exp.is_paid = True
+                            exp.paid_month = today
+                        exp.save()
+                else:
+                    # Gasto de contado
                     exp.is_paid = True
-                    exp.paid_month = first_day
-                exp.remaining_months = max(0, (exp.months or 0) - paid_count)
-                exp.save()
-        return Response({'message':'Pago del mes aplicado', 'count': installments.count()})
+                    exp.paid_month = today
+                    exp.save()
+                    
+                    details.append({
+                        'title': exp.title,
+                        'type': 'CONTADO',
+                        'info': "Pago único",
+                        'amount': float(exp.amount)
+                    })
+                    total_amount_processed += float(exp.amount)
+
+        return Response({
+            'message': 'Pago del mes aplicado',
+            'details': details, # Lista detallada
+            'total_amount': total_amount_processed,
+            'count': len(details)
+        })
+   
+    def undo_pay_month(self, request, card_id=None):
+       
+        with transaction.atomic():
+            # 1. Buscamos los MSI: revertimos el último installment pagado de cada gasto activo
+            expenses_msi = Expense.objects.filter(card_id=card_id, installments__isnull=False).distinct()
+            undone_details = []
+            total_reverted = 0
+            
+            for exp in expenses_msi:
+                last_paid = exp.installments.filter(is_paid=True).order_by('-month_number').first()
+                if last_paid:
+                    last_paid.is_paid = False
+                    last_paid.save()
+                    
+                    undone_details.append({
+                        'title': exp.title,
+                        'type': 'MSI (Revertido)',
+                        'info': f"Cuota {last_paid.month_number} devuelta",
+                        'amount': float(last_paid.amount)
+                    })
+                    total_reverted += float(last_paid.amount)
+                    
+                    # Actualizar el gasto padre
+                    exp.is_paid = False
+                    exp.paid_month = None
+                    paid_count = exp.installments.filter(is_paid=True).count()
+                    exp.remaining_months = (exp.months or 0) - paid_count
+                    exp.save()
+
+            # 2. Gastos únicos pagados hoy
+            unique_expenses = Expense.objects.filter(
+                card_id=card_id, 
+                installments__isnull=True, 
+                is_paid=True,
+                paid_month=date.today()
+            )
+            
+            for exp in unique_expenses:
+                undone_details.append({
+                    'title': exp.title,
+                    'type': 'CONTADO (Revertido)',
+                    'info': "Pago devuelto",
+                    'amount': float(exp.amount)
+                })
+                total_reverted += float(exp.amount)
+
+            unique_expenses.update(is_paid=False, paid_month=None)
+
+        return Response({
+            'message': 'Pago revertido con éxito',
+            'details': undone_details,
+            'total_amount': total_reverted,
+            'count': len(undone_details)
+        })
     def toggle_paid(self, request, card_id=None, pk=None):
         # toggle is_paid for the expense (liquidar o desmarcar)
         expense = self.get_object()
